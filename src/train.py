@@ -9,12 +9,14 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from . import config
 from .dataset import HyperspectralDetDataset, collate_fn
 from .model import build_model
+from .split import get_train_val_indices
+from .transforms import build_train_transforms
 from .utils.metrics import evaluate_coco_metrics
 from .utils.logging_utils import (
     setup_logger,
@@ -41,12 +43,18 @@ def set_seed(seed):
 from torch.cuda.amp import GradScaler, autocast
 
 
-def train_one_epoch(model, optimizer, loader, device, epoch, scaler, accum_steps=4):
+def train_one_epoch(model, optimizer, loader, device, epoch, scaler, accum_steps=4,
+                     warmup_iters=0, warmup_start_factor=0.01, base_lr=None):
     """Runs one training epoch. Returns (avg_total_loss, avg_component_losses dict).
 
     Per-batch numbers still stream to the tqdm progress bar in the terminal as
     before; only the epoch-level averages get handed back for logging, so the
     saved log file never sees per-batch noise.
+
+    If `warmup_iters > 0` (only meant to be passed on epoch 1 right after a
+    --resume), the LR is linearly ramped from `base_lr * warmup_start_factor`
+    up to `base_lr` over the first `warmup_iters` optimizer steps, instead of
+    hitting already-converged weights with the full target LR immediately.
     """
     model.train()
     running_loss = 0.0
@@ -54,6 +62,7 @@ def train_one_epoch(model, optimizer, loader, device, epoch, scaler, accum_steps
     n_batches = 0
     optimizer.zero_grad()
     pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
+    optimizer_step_idx = 0
 
     for i, (images, targets) in enumerate(pbar):
         # Skip batch if any target has 0 boxes
@@ -71,9 +80,21 @@ def train_one_epoch(model, optimizer, loader, device, epoch, scaler, accum_steps
         scaler.scale(loss).backward()
 
         if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            if warmup_iters > 0 and base_lr is not None:
+                if optimizer_step_idx < warmup_iters:
+                    factor = warmup_start_factor + (1 - warmup_start_factor) * (
+                        optimizer_step_idx / warmup_iters
+                    )
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = base_lr * factor
+                elif optimizer_step_idx == warmup_iters:
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = base_lr
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+            optimizer_step_idx += 1
 
         batch_loss = loss.item() * accum_steps
         running_loss += batch_loss
@@ -82,7 +103,7 @@ def train_one_epoch(model, optimizer, loader, device, epoch, scaler, accum_steps
                 component_sums[k] += loss_dict[k].item()
         n_batches += 1
 
-        pbar.set_postfix(loss=f"{batch_loss:.4f}")
+        pbar.set_postfix(loss=f"{batch_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
     n_batches = max(1, n_batches)
     avg_loss = running_loss / n_batches
@@ -154,6 +175,40 @@ def assert_run_dir_is_fresh(run_ckpt_dir: Path, logger):
     logger.info(f"Confirmed {run_ckpt_dir} is a fresh, empty checkpoint directory for this run.")
 
 
+def build_train_val_datasets(logger, use_augmentation: bool):
+    """Builds the train/val Subsets from two HyperspectralDetDataset instances
+    that share the exact same underlying sample list (same img_dir/ann_dir,
+    so the same deterministic sorted-glob order) but different `transforms`:
+    the train instance gets augmentation, the val instance never does.
+
+    The split indices come from `get_train_val_indices`, which reproduces
+    `random_split`'s exact behavior (same seed -> same split as before this
+    change), so validation scores stay comparable across runs made before and
+    after this refactor.
+    """
+    # Built once just to get the sample count / confirm the dataset is valid;
+    # its own `.transforms` is unused since we only read its length here.
+    probe_dataset = HyperspectralDetDataset()
+    n_samples = len(probe_dataset)
+    logger.info(f"Total training samples found: {n_samples}")
+
+    train_indices, val_indices = get_train_val_indices(n_samples, config.VAL_SPLIT, config.SEED)
+
+    train_transforms = build_train_transforms(config) if use_augmentation else None
+    if use_augmentation:
+        logger.info("Augmentation ENABLED for the train split (flips/rotate/affine jitter "
+                    "+ shared-across-bands brightness jitter). Val split stays un-augmented.")
+    else:
+        logger.info("Augmentation DISABLED (config.USE_AUGMENTATION=False or --no-augment).")
+
+    train_base = HyperspectralDetDataset(transforms=train_transforms)
+    val_base = HyperspectralDetDataset(transforms=None)
+
+    train_ds = Subset(train_base, train_indices)
+    val_ds = Subset(val_base, val_indices)
+    return train_ds, val_ds
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=config.NUM_EPOCHS)
@@ -164,6 +219,17 @@ def main():
     parser.add_argument(
         "--run-name", type=str, default=None,
         help="Optional custom name for this run's log/checkpoint subdirectory."
+    )
+    parser.add_argument(
+        "--no-augment", action="store_true",
+        help="Disable train-split augmentation even if config.USE_AUGMENTATION is True."
+    )
+    parser.add_argument(
+        "--warmup-iters", type=int, default=200,
+        help="Only applies on epoch 1 when --resume is set: linearly ramps LR from "
+             "(lr * 0.01) up to lr over this many optimizer steps, instead of hitting "
+             "already-converged resumed weights with the full target LR immediately. "
+             "Set to 0 to disable."
     )
     args = parser.parse_args()
 
@@ -195,14 +261,8 @@ def main():
     logger.info(f"Using device: {device}")
 
     try:
-        full_dataset = HyperspectralDetDataset()
-        logger.info(f"Total training samples found: {len(full_dataset)}")
-
-        n_val = max(1, int(len(full_dataset) * config.VAL_SPLIT))
-        n_train = len(full_dataset) - n_val
-        train_ds, val_ds = random_split(
-            full_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(config.SEED)
-        )
+        use_augmentation = config.USE_AUGMENTATION and not args.no_augment
+        train_ds, val_ds = build_train_val_datasets(logger, use_augmentation)
 
         train_loader = DataLoader(
             train_ds, batch_size=args.batch_size, shuffle=True,
@@ -233,7 +293,9 @@ def main():
             epoch_start = time.time()
 
             train_loss, train_components = train_one_epoch(
-                model, optimizer, train_loader, device, epoch, scaler, accum_steps=4
+                model, optimizer, train_loader, device, epoch, scaler, accum_steps=4,
+                warmup_iters=(args.warmup_iters if (args.resume and epoch == 1) else 0),
+                base_lr=args.lr,
             )
             scheduler.step()
 

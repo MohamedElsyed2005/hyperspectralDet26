@@ -1,4 +1,4 @@
-"""Single-model hyperspectral detector: Faster R-CNN with 16-band Spectral Attention Stem."""
+"""16-band Hyperspectral Faster R-CNN with Spectral Attention Stem."""
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ from . import config
 
 
 class SpectralChannelAttention(nn.Module):
-    """Squeeze-and-Excitation along the 16 spectral bands to model material reflectance."""
+    """Squeeze-and-Excitation along spectral bands to capture material reflectance signatures."""
     def __init__(self, in_channels: int = 16, reduction: int = 4):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -29,11 +29,10 @@ class SpectralChannelAttention(nn.Module):
 
 
 class SpectralStem(nn.Module):
-    """Integrates Spectral Attention with adapted 16-channel convolution."""
+    """Integrates Spectral Attention directly into the 16-channel input stem."""
     def __init__(self, original_conv1: nn.Conv2d, in_bands: int = 16):
         super().__init__()
         self.spectral_attn = SpectralChannelAttention(in_channels=in_bands)
-        
         self.conv1 = nn.Conv2d(
             in_bands,
             original_conv1.out_channels,
@@ -42,8 +41,6 @@ class SpectralStem(nn.Module):
             padding=original_conv1.padding,
             bias=(original_conv1.bias is not None),
         )
-        
-        # Replicate & scale pretrained RGB weights across the 16 spectral channels
         with torch.no_grad():
             avg_weight = original_conv1.weight.data.mean(dim=1, keepdim=True)
             self.conv1.weight.data = avg_weight.repeat(1, in_bands, 1, 1) / in_bands * 3
@@ -55,18 +52,18 @@ class SpectralStem(nn.Module):
         return self.conv1(x)
 
 
-def build_model(num_classes: int = None, pretrained_backbone: bool = True) -> FasterRCNN:
+def build_model(num_classes: int = None, pretrained: bool = True) -> FasterRCNN:
     num_classes = num_classes or (config.NUM_CLASSES + 1)
 
     image_mean = [0.5] * config.NUM_BANDS
     image_std = [0.5] * config.NUM_BANDS
 
+    # Load complete COCO pretrained Faster R-CNN (Backbone + FPN + RPN + RoI Head)
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
-        weights="DEFAULT" if pretrained_backbone else None,
-        weights_backbone="DEFAULT" if pretrained_backbone else None,
+        weights="DEFAULT" if pretrained else None,
         image_mean=image_mean,
         image_std=image_std,
-        min_size=300,       # Prevents upscaling to 800px (saves ~2.5 GB VRAM)
+        min_size=300,
         max_size=600,
     )
 
@@ -85,4 +82,4 @@ if __name__ == "__main__":
     dummy = [torch.randn(16, 256, 256)]
     with torch.no_grad():
         out = model(dummy)
-    print("Model initialized and dummy forward passed successfully!")
+    print("Pretrained base model verified successfully.")
